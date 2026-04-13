@@ -1,0 +1,224 @@
+/*
+ * Copyright 2022 - Jahred Love
+ *
+ * Redistribution and use in source and binary forms, with or without modification,
+ * are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice, this
+ * list of conditions and the following disclaimer in the documentation and/or other
+ * materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its contributors may
+ * be used to endorse or promote products derived from this software without specific
+ * prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS “AS IS” AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+ * IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT,
+ * INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+ * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+ * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+ * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
+//! Compilation orchestration: IR backend entry points.
+//!
+//! ## Pipeline overview (source modules)
+//!
+//! - **parse** (`parse::parse_program`)
+//! - **expand templates** (`templates::expand_templates`)
+//! - **frontend preparation** (`frontend::prepare_program`):
+//!   truthiness normalization + name resolution (and any future frontend passes)
+//! - **semantic analysis** (`semantic::analyze_prepared_*`):
+//!   typecheck + capture analysis, producing `(HIR, SemanticInfo)`
+//! - **lowering to IR** (`lower::*`)
+//! - **optimization passes** (`opt::*`)
+//! - **phi elimination + cleanup** (`phi::*`)
+//! - **codegen + validation** (`codegen::*`, `jlo::validate_module`)
+//!
+//! ### Key invariant
+//!
+//! All semantic + lowering entry points in this file operate on programs that have already been
+//! prepared via the frontend. This happens during module-graph loading (`link::load_module_graph`)
+//! and is represented explicitly via `frontend::PreparedProgram`.
+use std::collections::HashMap;
+use std::path::Path;
+
+use crate::codegen;
+use crate::error::CompileError;
+use crate::ir;
+use crate::jlo::{self, Module};
+use crate::link;
+use crate::lower;
+use crate::opt;
+use crate::phi;
+use crate::semantic;
+use crate::typectx::TypeRepr;
+
+/// Unified error type for compilation failures.
+#[derive(Debug)]
+pub enum CompileFailure {
+    Load(link::ModuleLoadError),
+    Compile {
+        err: CompileError,
+        src: String,
+        path: Option<String>,
+    },
+    Link(String),
+}
+
+impl CompileFailure {
+    pub fn render(&self) -> String {
+        match self {
+            CompileFailure::Load(e) => e.render(),
+            CompileFailure::Compile { err, src, path } => err.render(src, path.as_deref()),
+            CompileFailure::Link(msg) => format!("codegen error: {}", msg),
+        }
+    }
+}
+
+pub fn compile_prelude(out: &Path) -> Result<(), CompileError> {
+    let m = jlo::build_prelude_module();
+    let mut f = std::fs::File::create(out).map_err(|e| {
+        CompileError::new(
+            crate::error::ErrorKind::Codegen,
+            crate::ast::Span::point(0),
+            format!("{}", e),
+        )
+    })?;
+    m.write_to(&mut f).map_err(|e| {
+        CompileError::new(
+            crate::error::ErrorKind::Codegen,
+            crate::ast::Span::point(0),
+            format!("{}", e),
+        )
+    })?;
+    Ok(())
+}
+
+pub fn compile_file_ir(input: &Path) -> Result<Module, CompileFailure> {
+    let path_buf = input.to_path_buf();
+    let (nodes, entry_idx, _root_dir) =
+        link::load_module_graph(&path_buf).map_err(CompileFailure::Load)?;
+
+    let mut key_to_index: HashMap<String, usize> = HashMap::new();
+    for (i, n) in nodes.iter().enumerate() {
+        key_to_index.insert(n.key.clone(), i);
+    }
+
+    let mut artifacts: Vec<jlo::Module> = Vec::with_capacity(nodes.len());
+    let mut import_lists: Vec<Vec<usize>> = Vec::with_capacity(nodes.len());
+
+    for (i, n) in nodes.iter().enumerate() {
+        let deps: Vec<usize> = n
+            .import_keys
+            .iter()
+            .map(|k| *key_to_index.get(k).expect("dep in graph"))
+            .collect();
+        import_lists.push(deps);
+
+        match &n.file {
+            link::LoadedFile::Source { path, src, prog } => {
+                let path_str = path.display().to_string();
+                let mut import_exports: HashMap<String, HashMap<String, TypeRepr>> = HashMap::new();
+                for k in &n.import_keys {
+                    let di = *key_to_index.get(k).expect("dep index");
+                    import_exports.insert(k.clone(), nodes[di].exports.clone());
+                }
+
+                let prepared = crate::frontend::prepared(prog);
+                let (hir, info) = semantic::analyze_prepared_module_init(
+                    &n.key,
+                    prepared,
+                    i == entry_idx,
+                    false, // is_repl
+                    &import_exports,
+                )
+                .map_err(|err| CompileFailure::Compile {
+                    err,
+                    src: src.clone(),
+                    path: Some(path_str.clone()),
+                })?;
+                let lowered = lower::lower_module_init_to_ir(
+                    &n.key,
+                    &hir.program,
+                    &info,
+                    i == entry_idx,
+                    false, // is_repl
+                    &import_exports,
+                )
+                .map_err(|err| CompileFailure::Compile {
+                    err,
+                    src: src.clone(),
+                    path: Some(path_str.clone()),
+                })?;
+                let emitter = crate::source::DiagEmitter::new(src, Some(path_str.as_str()));
+                for w in &lowered.warnings {
+                    eprintln!("{}", emitter.render_warning(w.span, &w.message));
+                }
+                let mut irm = lowered.ir;
+                opt::run_passes(&mut irm).map_err(|err| CompileFailure::Compile {
+                    err,
+                    src: src.clone(),
+                    path: Some(path_str.clone()),
+                })?;
+                if std::env::var("JELLOC_DUMP_IR_POSTOPT").is_ok() {
+                    println!("-- IR postopt module: {} --", n.key);
+                    print!("{}", ir::render_ir(&irm));
+                }
+                phi::eliminate_phis(&mut irm).map_err(|err| CompileFailure::Compile {
+                    err,
+                    src: src.clone(),
+                    path: Some(path_str.clone()),
+                })?;
+                if std::env::var("JELLOC_DUMP_IR_POSTPHI").is_ok() {
+                    println!("-- IR postphi module: {} --", n.key);
+                    print!("{}", ir::render_ir(&irm));
+                }
+                opt::run_post_phi_cleanup(&mut irm);
+                if std::env::var("JELLOC_DUMP_IR_POSTPHICLEAN").is_ok() {
+                    println!("-- IR postphi(clean) module: {} --", n.key);
+                    print!("{}", ir::render_ir(&irm));
+                }
+                let mut bc =
+                    codegen::emit_ir_module(&irm).map_err(|err| CompileFailure::Compile {
+                        err,
+                        src: src.clone(),
+                        path: Some(path_str.clone()),
+                    })?;
+                if let Err(msg) = jlo::validate_module(&bc) {
+                    return Err(CompileFailure::Compile {
+                        err: CompileError::new(
+                            crate::error::ErrorKind::Codegen,
+                            crate::ast::Span::point(0),
+                            format!("bytecode validation failed: {msg}"),
+                        ),
+                        src: src.clone(),
+                        path: Some(path_str.clone()),
+                    });
+                }
+                let abi_blob = link::build_module_abi_blob(&lowered.exports, &lowered.import_keys);
+                bc.const_bytes.push(abi_blob);
+                artifacts.push(bc);
+            }
+            link::LoadedFile::Bytecode { module, .. } => {
+                artifacts.push(module.clone());
+            }
+        }
+    }
+
+    let out = link::link_modules_and_build_entry(&artifacts, &import_lists, entry_idx, false)
+        .map_err(CompileFailure::Link)?;
+    if let Err(msg) = jlo::validate_module(&out) {
+        return Err(CompileFailure::Link(format!(
+            "linked bytecode validation failed: {msg}"
+        )));
+    }
+    Ok(out)
+}
